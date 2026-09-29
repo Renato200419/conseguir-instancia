@@ -2,14 +2,19 @@ name: Reintentar crear instancia ARM (A1.Flex)
 
 on:
   schedule:
-    # Corre cada 10 minutos. GitHub no garantiza el minuto exacto,
-    # pero se ejecuta con esa frecuencia aproximada.
-    - cron: '*/5 * * * *'
-  workflow_dispatch: {}   # Te permite lanzarlo manualmente desde la pestaña "Actions"
+    - cron: '7,37 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: oci-launch
+  cancel-in-progress: false
 
 jobs:
   intentar-crear:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 58
+    env:
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
     steps:
       - name: Instalar OCI CLI
         run: pip install oci-cli
@@ -27,8 +32,9 @@ jobs:
           region=${{ secrets.OCI_REGION }}
           key_file=~/.oci/key.pem
           EOF
+          chmod 600 ~/.oci/config
 
-      - name: Revisar si ya existe una instancia corriendo
+      - name: Revisar si ya existe una instancia
         id: check
         run: |
           COUNT=$(oci compute instance list \
@@ -45,30 +51,51 @@ jobs:
         if: steps.check.outputs.count == '0'
         run: printf '%s' "${{ secrets.SSH_PUBLIC_KEY }}" > /tmp/id_rsa.pub
 
-      - name: Intentar lanzar la instancia
+      - name: Reintentar lanzar la instancia (bucle de ~50 min)
         if: steps.check.outputs.count == '0'
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
           set +e
-          RESULT=$(oci compute instance launch \
-            --compartment-id "${{ secrets.OCI_COMPARTMENT_OCID }}" \
-            --availability-domain "${{ secrets.OCI_AD }}" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config "{\"ocpus\": ${{ secrets.OCI_OCPUS }}, \"memoryInGBs\": ${{ secrets.OCI_MEMORY_GB }}}" \
-            --subnet-id "${{ secrets.OCI_SUBNET_OCID }}" \
-            --image-id "${{ secrets.OCI_IMAGE_OCID }}" \
-            --assign-public-ip true \
-            --ssh-authorized-keys-file /tmp/id_rsa.pub \
-            --display-name "mi-instancia-arm" 2>&1)
-          echo "$RESULT"
+          notificar() {
+            if [ -n "$NTFY_TOPIC" ]; then
+              curl -s -d "$1" "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
+            else
+              echo "AVISO: el secret NTFY_TOPIC esta vacio, no se puede notificar."
+            fi
+          }
 
-          if echo "$RESULT" | grep -qi '"lifecycle-state": "PROVISIONING"\|"lifecycle-state": "RUNNING"'; then
-            echo "¡ÉXITO! Instancia creada."
-            curl -s -d "✅ Tu instancia ARM en Oracle Cloud fue creada con éxito. Entra a la consola a verla." \
-              "https://ntfy.sh/${{ secrets.NTFY_TOPIC }}"
-          elif echo "$RESULT" | grep -qi "out of host capacity\|OutOfCapacity"; then
-            echo "Sin capacidad todavía. Se reintentará en el próximo ciclo."
-          else
-            echo "Ocurrió otro tipo de error, revisa el log completo arriba."
-            curl -s -d "⚠️ El script de Oracle tuvo un error distinto a 'sin capacidad'. Revisa GitHub Actions." \
-              "https://ntfy.sh/${{ secrets.NTFY_TOPIC }}"
-          fi
+          FIN=$((SECONDS + 3000))
+          INTENTO=0
+          while [ $SECONDS -lt $FIN ]; do
+            INTENTO=$((INTENTO + 1))
+            RESULT=$(oci compute instance launch \
+              --compartment-id "${{ secrets.OCI_COMPARTMENT_OCID }}" \
+              --availability-domain "${{ secrets.OCI_AD }}" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config "{\"ocpus\": ${{ secrets.OCI_OCPUS }}, \"memoryInGBs\": ${{ secrets.OCI_MEMORY_GB }}}" \
+              --subnet-id "${{ secrets.OCI_SUBNET_OCID }}" \
+              --image-id "${{ secrets.OCI_IMAGE_OCID }}" \
+              --assign-public-ip true \
+              --ssh-authorized-keys-file /tmp/id_rsa.pub \
+              --display-name "mi-instancia-arm" \
+              --no-retry 2>&1)
+
+            if echo "$RESULT" | grep -qi '"lifecycle-state": "PROVISIONING"\|"lifecycle-state": "RUNNING"'; then
+              echo "EXITO en el intento $INTENTO. Instancia creada."
+              notificar "Tu instancia ARM en Oracle Cloud fue creada. Entra a la consola a verla."
+              exit 0
+            elif echo "$RESULT" | grep -qi "out of host capacity\|OutOfCapacity\|out of capacity"; then
+              echo "Intento $INTENTO: sin capacidad todavia."
+            elif echo "$RESULT" | grep -qi "TooManyRequests\|Too many requests"; then
+              echo "Intento $INTENTO: Oracle limito las peticiones (429). Espero 3 minutos."
+              sleep 120
+            else
+              echo "$RESULT"
+              echo "Error distinto a falta de capacidad. Se detiene."
+              notificar "El script de Oracle fallo con un error distinto a 'sin capacidad'. Revisa GitHub Actions."
+              exit 1
+            fi
+            sleep 60
+          done
+          echo "Fin del ciclo de ~50 min sin conseguir instancia. Otra ejecucion continuara."
