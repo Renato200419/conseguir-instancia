@@ -9,6 +9,10 @@ concurrency:
   group: oci-launch
   cancel-in-progress: false
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   intentar-crear:
     runs-on: ubuntu-24.04
@@ -52,6 +56,7 @@ jobs:
         run: printf '%s' "${{ secrets.SSH_PUBLIC_KEY }}" > /tmp/id_rsa.pub
 
       - name: Reintentar lanzar la instancia (bucle de ~50 min)
+        id: loop
         if: steps.check.outputs.count == '0'
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
@@ -98,4 +103,11 @@ jobs:
             fi
             sleep 60
           done
-          echo "Fin del ciclo de ~50 min sin conseguir instancia. Otra ejecucion continuara."
+          echo "Fin del ciclo de ~50 min sin conseguir instancia."
+          echo "reintentar=true" >> "$GITHUB_OUTPUT"
+
+      - name: Relanzar el workflow
+        if: steps.loop.outputs.reintentar == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run retry.yml --ref main
