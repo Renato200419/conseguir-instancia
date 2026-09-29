@@ -1,0 +1,73 @@
+name: Reintentar crear instancia ARM (A1.Flex)
+
+on:
+  schedule:
+    # Corre cada 10 minutos. GitHub no garantiza el minuto exacto,
+    # pero se ejecuta con esa frecuencia aproximada.
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}   # Te permite lanzarlo manualmente desde la pestaña "Actions"
+
+jobs:
+  intentar-crear:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Instalar OCI CLI
+        run: pip install oci-cli
+
+      - name: Configurar credenciales de OCI
+        run: |
+          mkdir -p ~/.oci
+          printf '%s' "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/key.pem
+          EOF
+
+      - name: Revisar si ya existe una instancia corriendo
+        id: check
+        run: |
+          COUNT=$(oci compute instance list \
+            --compartment-id "${{ secrets.OCI_COMPARTMENT_OCID }}" \
+            --lifecycle-state RUNNING \
+            --all \
+            --query "length(data[?shape=='VM.Standard.A1.Flex'])" \
+            --raw-output)
+          echo "Instancias A1.Flex corriendo: $COUNT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Guardar la clave pública SSH en un archivo
+        if: steps.check.outputs.count == '0'
+        run: printf '%s' "${{ secrets.SSH_PUBLIC_KEY }}" > /tmp/id_rsa.pub
+
+      - name: Intentar lanzar la instancia
+        if: steps.check.outputs.count == '0'
+        run: |
+          set +e
+          RESULT=$(oci compute instance launch \
+            --compartment-id "${{ secrets.OCI_COMPARTMENT_OCID }}" \
+            --availability-domain "${{ secrets.OCI_AD }}" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config "{\"ocpus\": ${{ secrets.OCI_OCPUS }}, \"memoryInGBs\": ${{ secrets.OCI_MEMORY_GB }}}" \
+            --subnet-id "${{ secrets.OCI_SUBNET_OCID }}" \
+            --image-id "${{ secrets.OCI_IMAGE_OCID }}" \
+            --assign-public-ip true \
+            --ssh-authorized-keys-file /tmp/id_rsa.pub \
+            --display-name "mi-instancia-arm" 2>&1)
+          echo "$RESULT"
+
+          if echo "$RESULT" | grep -qi '"lifecycle-state": "PROVISIONING"\|"lifecycle-state": "RUNNING"'; then
+            echo "¡ÉXITO! Instancia creada."
+            curl -s -d "✅ Tu instancia ARM en Oracle Cloud fue creada con éxito. Entra a la consola a verla." \
+              "https://ntfy.sh/${{ secrets.NTFY_TOPIC }}"
+          elif echo "$RESULT" | grep -qi "out of host capacity\|OutOfCapacity"; then
+            echo "Sin capacidad todavía. Se reintentará en el próximo ciclo."
+          else
+            echo "Ocurrió otro tipo de error, revisa el log completo arriba."
+            curl -s -d "⚠️ El script de Oracle tuvo un error distinto a 'sin capacidad'. Revisa GitHub Actions." \
+              "https://ntfy.sh/${{ secrets.NTFY_TOPIC }}"
+          fi
