@@ -110,4 +110,5 @@ jobs:
         if: steps.loop.outputs.reintentar == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: gh workflow run retry.yml --ref main
